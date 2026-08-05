@@ -1071,22 +1071,55 @@ def _make_plan(user_text):
         "You are a robot task planner. Read the user's request and output the COMPLETE "
         "ordered list of steps as a JSON array. Output ONLY the JSON array, nothing else.\n\n"
         "Step types:\n"
-        '  {"action":"move","marker":"<exact_name>"}\n'
-        '  {"action":"charge"}\n'
+        '  {"action":"move","marker":"<exact_marker_name>"}\n'
+        '  {"action":"charge"}   (for going home / to the charger)\n'
         '  {"action":"wait","seconds":<number>}\n'
-        '  {"action":"status"}\n\n'
-        "Available markers: " + ", ".join(known) + "\n\n"
-        "Rules:\n"
-        '- "front desk"/"reception" -> move to Frontdesk\n'
-        '- "meeting room" -> Meetingroom\n'
-        '- "kitchen" -> Kitchen\n'
-        '- "restaurant"/"dining" -> steakhouse\n'
-        '- "security" -> securitycheck\n'
-        '- "home"/"charge"/"charger"/"go back" -> {"action":"charge"}\n'
-        '- "wait N seconds/minutes" -> {"action":"wait","seconds":N} (1 min = 60)\n\n'
-        'Example: "go to front desk, wait 10 seconds, then go home" ->\n'
-        '[{"action":"move","marker":"Frontdesk"},{"action":"wait","seconds":10},{"action":"charge"}]'
+        '  {"action":"status"}   (to check battery/position)\n\n'
+        "AVAILABLE MARKERS (these are the ONLY valid destinations):\n"
+        + "\n".join(f"  - {m}" for m in known) + "\n\n"
+        "Your job is to match what the user says to the BEST marker from the list above. "
+        "The user will use casual language — figure out which real marker they mean:\n"
+        '  - They might say "front desk", "the desk", "lobby" -> pick the closest marker like Frontdesk\n'
+        '  - "reception", "check-in" -> pick the reception-related marker (e.g. toReception)\n'
+        '  - "meeting room", "conference" -> Meetingroom\n'
+        '  - "restaurant", "dining", "steakhouse", "food" -> steakhouse\n'
+        '  - "security", "checkpoint" -> securitycheck\n'
+        '  - "kitchen" -> Kitchen\n'
+        "Always choose the single closest marker from the AVAILABLE MARKERS list — never invent a name.\n"
+        'For "home", "charge", "charger", "dock", "go back to charge" use {"action":"charge"}.\n'
+        'For time: "wait a minute" = 60 seconds, "wait 30 seconds" = 30.\n\n'
+        'Example (if Frontdesk and steakhouse are in the list): '
+        '"go to the front desk, wait 10 sec, then the restaurant" ->\n'
+        '[{"action":"move","marker":"Frontdesk"},{"action":"wait","seconds":10},{"action":"move","marker":"steakhouse"}]'
     )
+
+    def _snap_to_marker(name):
+        """Snap Qwen's chosen marker to the closest real marker (case-insensitive,
+        substring, then fuzzy). Prevents invalid names from failing the move."""
+        if not name:
+            return None
+        # Exact match
+        for m in known:
+            if m == name:
+                return m
+        # Case-insensitive exact
+        for m in known:
+            if m.lower() == name.lower():
+                return m
+        # Substring either direction
+        nlow = name.lower()
+        for m in known:
+            if nlow in m.lower() or m.lower() in nlow:
+                return m
+        # Fuzzy closest by shared prefix / difflib
+        try:
+            import difflib
+            match = difflib.get_close_matches(name, known, n=1, cutoff=0.5)
+            if match:
+                return match[0]
+        except Exception:
+            pass
+        return name  # give up, use as-is
 
     try:
         resp = client.chat.completions.create(
@@ -1100,12 +1133,15 @@ def _make_plan(user_text):
         if not m:
             return None
         steps = json.loads(m.group())
-        # Validate
+        # Validate + snap markers to real names
         valid = []
         for s in steps:
             a = s.get("action","")
             if a == "move" and s.get("marker"):
-                valid.append({"action":"move","marker":s["marker"]})
+                snapped = _snap_to_marker(s["marker"])
+                if snapped != s["marker"]:
+                    print(f"[PLAN] Snapped '{s['marker']}' -> '{snapped}'", file=sys.stderr, flush=True)
+                valid.append({"action":"move","marker":snapped})
             elif a == "charge":
                 valid.append({"action":"charge"})
             elif a == "wait" and s.get("seconds") is not None:
@@ -1226,9 +1262,40 @@ def _ensure_worker():
 def _classify_intent(user_text):
     """
     Decide if this is a ROBOT COMMAND or just CHAT/QUESTION.
-    Uses Qwen so it's smart, not keyword-matching.
+    Fast keyword pre-check first (reliable), then Qwen for ambiguous cases.
     Returns "command" or "chat".
     """
+    t = user_text.lower().strip()
+
+    # ── Fast path 1: obvious CHAT (questions about capabilities/status) ────────
+    chat_starts = ("what can you", "what are you", "who are you", "what do you",
+                   "how are you", "hello", "hi ", "hey", "thanks", "thank you",
+                   "what's your", "whats your", "where are you", "how do you",
+                   "can you help", "what is your")
+    if t in ("hi","hello","hey","thanks","thank you","yo","sup"):
+        print(f"[INTENT] '{user_text}' -> chat (greeting)", file=sys.stderr, flush=True)
+        return "chat"
+    if any(t.startswith(p) for p in chat_starts) and "go to" not in t and "move" not in t:
+        print(f"[INTENT] '{user_text}' -> chat (question)", file=sys.stderr, flush=True)
+        return "chat"
+
+    # ── Fast path 2: obvious COMMAND (movement/location words) ─────────────────
+    # Build the live marker name list for matching
+    markers_lower = ["frontdesk","front desk","meetingroom","meeting room","kitchen",
+                     "steakhouse","restaurant","dining","waiting","demotest","destination",
+                     "securitycheck","security check","security","reception","toreception",
+                     "summon","charger","charging"]
+    command_verbs = ["go to","go back","come back","move to","head to","navigate",
+                     "drive to","take me","bring","deliver","return to","go home",
+                     "come to","walk to","proceed to","travel to"]
+    if any(v in t for v in command_verbs):
+        print(f"[INTENT] '{user_text}' -> command (verb)", file=sys.stderr, flush=True)
+        return "command"
+    if any(m in t for m in markers_lower) and any(w in t for w in ["go","move","come","head","take","bring","return","drive","walk"]):
+        print(f"[INTENT] '{user_text}' -> command (marker+verb)", file=sys.stderr, flush=True)
+        return "command"
+
+    # ── Ambiguous: ask Qwen ────────────────────────────────────────────────────
     try:
         resp = client.chat.completions.create(
             model=QWEN_MODEL,
@@ -1245,11 +1312,13 @@ def _classify_intent(user_text):
             ],
             max_tokens=5)
         ans = (resp.choices[0].message.content or "").strip().lower()
-        print(f"[INTENT] '{user_text}' -> {ans}", file=sys.stderr, flush=True)
+        print(f"[INTENT] '{user_text}' -> {ans} (qwen)", file=sys.stderr, flush=True)
         return "command" if "command" in ans else "chat"
     except Exception as e:
-        print(f"[INTENT] Error: {e}, defaulting to chat", file=sys.stderr, flush=True)
-        return "chat"
+        # On error, default to chat only for short messages; longer ones likely commands
+        fallback = "command" if len(t.split()) > 3 else "chat"
+        print(f"[INTENT] Error: {e}, defaulting to {fallback}", file=sys.stderr, flush=True)
+        return fallback
 
 
 def _chat_reply(user_text):
@@ -1468,9 +1537,14 @@ def tq_resume_route():
 
 @app.route("/tq/cancel_current", methods=["POST"])
 def tq_cancel_current():
-    try: robot_cancel_task()
-    except Exception: pass
+    # Set the software flag first so the agent loop stops watching
     tq_cancel_event.set()
+    # Then tell the robot to physically stop
+    try:
+        res = robot_cancel_task()
+        print(f"[CANCEL] robot cancel response: {res}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[CANCEL] robot cancel failed: {e}", file=sys.stderr, flush=True)
     return jsonify({"ok":True})
 
 @app.route("/tq/clear", methods=["POST"])
