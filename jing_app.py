@@ -47,6 +47,18 @@ def tq_push(update_type, task_id=None, status=None, extra=None, detail=None, api
     if detail   is not None: msg["detail"]  = detail   # live status text
     if api      is not None: msg["api"]     = api      # API endpoint called
     if extra    is not None: msg.update(extra)
+    # Persist onto the task dict so /tq/state polling always has current info
+    if task_id is not None:
+        try:
+            with task_queue_lock:
+                for t in task_queue:
+                    if t["id"] == task_id:
+                        if status is not None: t["status"] = status
+                        if detail is not None: t["detail"] = detail
+                        if api    is not None: t["api"]    = api
+                        break
+        except Exception:
+            pass
     print(f"[TQ] {update_type} task={task_id} status={status} {detail or ''}", file=sys.stderr, flush=True)
     sse_queue.put(msg)
 
@@ -839,13 +851,18 @@ def _execute_agent_tool(name, args, cancel_event):
     """
     if name == "move_to":
         marker = args.get("marker", "").strip()
-        tid = tq_new_id()
-        with task_queue_lock:
-            task_queue.append({"id":tid,"type":"move","label":f"Go to {marker}",
-                               "status":"in_progress","marker":marker})
-        tq_push("add", task_id=tid, status="in_progress",
-                extra={"label":f"Go to {marker}","ttype":"move"},
-                api=f"GET /api/move?marker={marker}")
+        tid = args.get("_tid")
+        if tid:
+            tq_push("status", task_id=tid, status="in_progress",
+                    detail="Starting...", api=f"GET /api/move?marker={marker}")
+        else:
+            tid = tq_new_id()
+            with task_queue_lock:
+                task_queue.append({"id":tid,"type":"move","label":f"Go to {marker}",
+                                   "status":"in_progress","marker":marker})
+            tq_push("add", task_id=tid, status="in_progress",
+                    extra={"label":f"Go to {marker}","ttype":"move"},
+                    api=f"GET /api/move?marker={marker}")
 
         # Send move command
         r   = requests.get(f"{ROBOT_BASE_URL}/api/move",
@@ -883,7 +900,7 @@ def _execute_agent_tool(name, args, cancel_event):
                     api=f"GET /api/move?marker={marker}")
             if snap["running_status"]=="idle" and snap["move_status"]=="succeeded":
                 tq_push("status", task_id=tid, status="completed", detail=f"✅ Arrived at {marker}")
-                time_module.sleep(0.5)
+                time_module.sleep(1.5)
                 with task_queue_lock:
                     task_queue[:] = [t for t in task_queue if t["id"] != tid]
                 tq_push("remove", task_id=tid)
@@ -903,7 +920,7 @@ def _execute_agent_tool(name, args, cancel_event):
                 still += 1
                 if still >= 4:
                     tq_push("status", task_id=tid, status="completed", detail=f"✅ Reached {marker}")
-                    time_module.sleep(0.5)
+                    time_module.sleep(1.5)
                     with task_queue_lock:
                         task_queue[:] = [t for t in task_queue if t["id"] != tid]
                     tq_push("remove", task_id=tid)
@@ -922,13 +939,18 @@ def _execute_agent_tool(name, args, cancel_event):
                 "robot_status":robot_snapshot()}
 
     elif name == "go_charge":
-        tid = tq_new_id()
-        with task_queue_lock:
-            task_queue.append({"id":tid,"type":"go_home","label":"Return to charger",
-                               "status":"in_progress","marker":""})
-        tq_push("add", task_id=tid, status="in_progress",
-                extra={"label":"Return to charger","ttype":"go_home"},
-                api="POST /api/tools/operation/task/go-back")
+        tid = args.get("_tid")
+        if tid:
+            tq_push("status", task_id=tid, status="in_progress",
+                    detail="Starting...", api="POST /api/tools/operation/task/go-back")
+        else:
+            tid = tq_new_id()
+            with task_queue_lock:
+                task_queue.append({"id":tid,"type":"go_home","label":"Return to charger",
+                                   "status":"in_progress","marker":""})
+            tq_push("add", task_id=tid, status="in_progress",
+                    extra={"label":"Return to charger","ttype":"go_home"},
+                    api="POST /api/tools/operation/task/go-back")
 
         r = requests.post(f"http://{ROBOT_IP}:19001/api/tools/operation/task/go-back",
                           json={}, timeout=TIMEOUT)
@@ -937,6 +959,7 @@ def _execute_agent_tool(name, args, cancel_event):
         push_update("Heading to charging station...", "moving")
 
         deadline = time_module.time() + 300
+        last_pos = None; still = 0
         while time_module.time() < deadline:
             if cancel_event.is_set():
                 return {"success":False,"reason":"cancelled","robot_status":robot_snapshot()}
@@ -949,7 +972,7 @@ def _execute_agent_tool(name, args, cancel_event):
                     api="POST .../task/go-back")
             if snap["is_charging"]:
                 tq_push("status", task_id=tid, status="completed", detail="✅ Docked & charging")
-                time_module.sleep(0.5)
+                time_module.sleep(1.5)
                 with task_queue_lock:
                     task_queue[:] = [t for t in task_queue if t["id"] != tid]
                 tq_push("remove", task_id=tid)
@@ -957,12 +980,27 @@ def _execute_agent_tool(name, args, cancel_event):
                 return {"success":True,"reason":"docked","robot_status":snap}
             if snap["running_status"]=="idle" and snap["move_status"]=="succeeded":
                 tq_push("status", task_id=tid, status="completed", detail="✅ Home")
-                time_module.sleep(0.5)
+                time_module.sleep(1.5)
                 with task_queue_lock:
                     task_queue[:] = [t for t in task_queue if t["id"] != tid]
                 tq_push("remove", task_id=tid)
                 push_update("Back home.", "arrived")
                 return {"success":True,"reason":"home","robot_status":snap}
+            # Stuck detection: robot stopped moving near the charger but no
+            # explicit success flag. If position hasn't changed while idle, treat as done.
+            if last_pos == pos and snap["running_status"] == "idle":
+                still += 1
+                if still >= 4:  # ~8s stationary + idle
+                    tq_push("status", task_id=tid, status="completed", detail="✅ Home")
+                    time_module.sleep(1.5)
+                    with task_queue_lock:
+                        task_queue[:] = [t for t in task_queue if t["id"] != tid]
+                    tq_push("remove", task_id=tid)
+                    push_update("Back home.", "arrived")
+                    return {"success":True,"reason":"home (idle)","robot_status":snap}
+            else:
+                still = 0
+            last_pos = pos
 
         with task_queue_lock:
             task_queue[:] = [t for t in task_queue if t["id"] != tid]
@@ -971,12 +1009,16 @@ def _execute_agent_tool(name, args, cancel_event):
 
     elif name == "wait":
         secs = int(args.get("seconds", 5))
-        tid = tq_new_id()
-        with task_queue_lock:
-            task_queue.append({"id":tid,"type":"wait","label":f"Wait {secs}s",
-                               "status":"in_progress","seconds":secs})
-        tq_push("add", task_id=tid, status="in_progress",
-                extra={"label":f"Wait {secs}s","ttype":"wait"})
+        tid = args.get("_tid")
+        if tid:
+            tq_push("status", task_id=tid, status="in_progress", detail=f"Waiting {secs}s...")
+        else:
+            tid = tq_new_id()
+            with task_queue_lock:
+                task_queue.append({"id":tid,"type":"wait","label":f"Wait {secs}s",
+                                   "status":"in_progress","seconds":secs})
+            tq_push("add", task_id=tid, status="in_progress",
+                    extra={"label":f"Wait {secs}s","ttype":"wait"})
         push_update(f"Waiting {secs}s...", "wait")
         for i in range(secs):
             if cancel_event.is_set():
@@ -987,7 +1029,7 @@ def _execute_agent_tool(name, args, cancel_event):
                 push_update(f"⏳ {remaining}s remaining...", "wait")
             time_module.sleep(1)
         tq_push("status", task_id=tid, status="completed", detail="✅ Done")
-        time_module.sleep(0.4)
+        time_module.sleep(1.5)
         with task_queue_lock:
             task_queue[:] = [t for t in task_queue if t["id"] != tid]
         tq_push("remove", task_id=tid)
@@ -1008,17 +1050,12 @@ def _execute_agent_tool(name, args, cancel_event):
     return {"success":False,"reason":f"unknown tool {name}"}
 
 
-def run_agent(user_text, cancel_event):
+def _make_plan(user_text):
     """
-    The intelligent agent. Qwen reads the command, decides actions one at a time,
-    reads the REAL robot response after each, and decides what to do next.
-    Qwen interprets success/failure itself — we just report facts.
+    Ask Qwen ONCE to produce the full ordered plan as a JSON checklist.
+    This is the reliable way to get multi-step sequences from a local model —
+    one focused call instead of hoping it remembers to continue.
     """
-    print(f"[AGENT] >>> run_agent STARTED for: {user_text}", file=sys.stderr, flush=True)
-    print(f"[AGENT] >>> cancel_event.is_set()={cancel_event.is_set()}", file=sys.stderr, flush=True)
-    # Make sure we start fresh — clear any leftover cancel flag
-    cancel_event.clear()
-
     known = ["Frontdesk","front_desk","Meetingroom","Kitchen","steakhouse",
              "waiting","waiting1","Demotest","securitycheck","toReception",
              "summon_point_5","destination"]
@@ -1030,134 +1067,274 @@ def run_agent(user_text, cancel_event):
     except Exception:
         pass
 
-    marker_list = ", ".join(known)
     system = (
-        "You are Aria, an intelligent hotel service robot. You control a real physical robot and decide its actions.\n\n"
-        "You work step by step:\n"
-        "1. Read the user's request and the current robot status\n"
-        "2. Call ONE tool to take the next action\n"
-        "3. Read the tool's result (which includes the real robot status)\n"
-        "4. Decide the next action, or call finish() when the whole request is done\n\n"
-        "You interpret results yourself:\n"
-        '- Each tool returns a JSON result with "success" (true/false), "reason", and "robot_status"\n'
-        "- If success is true, the action worked — move on to the next step\n"
-        "- If success is false, decide whether to retry, try something else, or finish with an explanation\n"
-        "- Trust the robot_status position and battery to understand what's happening\n\n"
-        "Available markers (use exact names): " + marker_list + "\n\n"
-        "Interpretation rules:\n"
-        '- "front desk" = Frontdesk, "meeting room" = Meetingroom, "restaurant"/"dining" = steakhouse\n'
-        '- "home"/"charge"/"charger" = use go_charge (NOT move_to)\n'
-        '- "security" = securitycheck\n'
-        '- Convert time: "1 minute" = wait(60)\n\n'
-        "Be warm and concise in your finish() message. Reply in the user's language.\n"
-        "Always call finish() at the end with a friendly summary."
+        "You are a robot task planner. Read the user's request and output the COMPLETE "
+        "ordered list of steps as a JSON array. Output ONLY the JSON array, nothing else.\n\n"
+        "Step types:\n"
+        '  {"action":"move","marker":"<exact_name>"}\n'
+        '  {"action":"charge"}\n'
+        '  {"action":"wait","seconds":<number>}\n'
+        '  {"action":"status"}\n\n'
+        "Available markers: " + ", ".join(known) + "\n\n"
+        "Rules:\n"
+        '- "front desk"/"reception" -> move to Frontdesk\n'
+        '- "meeting room" -> Meetingroom\n'
+        '- "kitchen" -> Kitchen\n'
+        '- "restaurant"/"dining" -> steakhouse\n'
+        '- "security" -> securitycheck\n'
+        '- "home"/"charge"/"charger"/"go back" -> {"action":"charge"}\n'
+        '- "wait N seconds/minutes" -> {"action":"wait","seconds":N} (1 min = 60)\n\n'
+        'Example: "go to front desk, wait 10 seconds, then go home" ->\n'
+        '[{"action":"move","marker":"Frontdesk"},{"action":"wait","seconds":10},{"action":"charge"}]'
     )
 
-    messages = [
-        {"role":"system","content":system},
-        {"role":"user","content":f"Request: {user_text}\n\nCurrent robot status: {json.dumps(robot_snapshot())}"}
-    ]
+    try:
+        resp = client.chat.completions.create(
+            model=QWEN_MODEL,
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user_text}],
+            max_tokens=400)
+        raw = resp.choices[0].message.content or ""
+        print(f"[PLAN] Qwen raw plan: {raw[:200]}", file=sys.stderr, flush=True)
+        m = re_module.search(r'\[.*\]', raw, re_module.DOTALL)
+        if not m:
+            return None
+        steps = json.loads(m.group())
+        # Validate
+        valid = []
+        for s in steps:
+            a = s.get("action","")
+            if a == "move" and s.get("marker"):
+                valid.append({"action":"move","marker":s["marker"]})
+            elif a == "charge":
+                valid.append({"action":"charge"})
+            elif a == "wait" and s.get("seconds") is not None:
+                valid.append({"action":"wait","seconds":int(s["seconds"])})
+            elif a == "status":
+                valid.append({"action":"status"})
+        return valid or None
+    except Exception as e:
+        print(f"[PLAN] Error: {e}", file=sys.stderr, flush=True)
+        return None
 
-    for step in range(20):
+
+def run_agent(user_text, cancel_event):
+    """
+    Plan-then-execute agent:
+    1. Qwen produces the full ordered plan (one reliable call)
+    2. We execute each step deterministically, polling to real completion
+    3. Qwen writes a warm summary at the end
+    This avoids the local model's tendency to stop after the first step.
+    """
+    print(f"[AGENT] >>> run_agent STARTED for: {user_text}", file=sys.stderr, flush=True)
+    cancel_event.clear()
+
+    # Step 1: get the full plan
+    plan = _make_plan(user_text)
+    print(f"[AGENT] Plan: {plan}", file=sys.stderr, flush=True)
+
+    if not plan:
+        # Couldn't parse a plan — fall back to a single interpreted action
+        push_update("I couldn't quite plan that out. Could you rephrase?", "error")
+        return
+
+    # Build labels and PRE-POPULATE the whole queue as "planned" so the user
+    # sees every step upfront, then each turns in-progress -> completed live.
+    step_names = []
+    for s in plan:
+        if s["action"] == "move":   step_names.append(f"go to {s['marker']}")
+        elif s["action"] == "charge": step_names.append("return to charger")
+        elif s["action"] == "wait":   step_names.append(f"wait {s['seconds']}s")
+        elif s["action"] == "status": step_names.append("check status")
+
+    type_map = {"move":"move","charge":"go_home","wait":"wait","status":"status"}
+    label_map = {"move":lambda s:f"Go to {s['marker']}",
+                 "charge":lambda s:"Return to charger",
+                 "wait":lambda s:f"Wait {s['seconds']}s",
+                 "status":lambda s:"Check status"}
+    for s in plan:
+        tid = tq_new_id()
+        s["_tid"] = tid
+        task = {"id":tid, "type":type_map.get(s["action"],"move"),
+                "label":label_map[s["action"]](s), "status":"planned",
+                "marker":s.get("marker",""), "seconds":s.get("seconds",0)}
+        with task_queue_lock:
+            task_queue.append(task)
+        tq_push("add", task_id=tid, status="planned",
+                extra={"label":task["label"],"ttype":task["type"]})
+
+    push_update(f"Planned {len(plan)} steps: " + " → ".join(step_names) + ". Starting now!",
+                "sequence_started")
+
+    # Step 2: execute each step in order, driving its pre-created queue task
+    for i, s in enumerate(plan):
         if cancel_event.is_set():
-            push_update("Okay, I've stopped.", "cancelled")
+            push_update("Stopped.", "cancelled")
             return
 
-        print(f"[AGENT] === Step {step+1}: asking Qwen ===", file=sys.stderr, flush=True)
+        action = s["action"]
+        tid    = s.get("_tid")
+        print(f"[AGENT] Executing step {i+1}/{len(plan)}: {action}", file=sys.stderr, flush=True)
+
+        if action == "move":
+            result = _execute_agent_tool("move_to", {"marker": s["marker"], "_tid": tid}, cancel_event)
+        elif action == "charge":
+            result = _execute_agent_tool("go_charge", {"_tid": tid}, cancel_event)
+        elif action == "wait":
+            result = _execute_agent_tool("wait", {"seconds": s["seconds"], "_tid": tid}, cancel_event)
+        elif action == "status":
+            result = _execute_agent_tool("check_status", {"_tid": tid}, cancel_event)
+        else:
+            continue
+
+        print(f"[AGENT] Step {i+1} result: {json.dumps(result)[:120]}", file=sys.stderr, flush=True)
+
+        # If a step fails, stop and explain
+        if not result.get("success", False) and action in ("move", "charge"):
+            reason = result.get("reason", "unknown issue")
+            push_update(f"I had to stop — {reason}. Let me know how you'd like to proceed.", "error")
+            return
+
+    # Step 3: warm summary
+    push_update("All done! Everything you asked for is complete. Anything else?", "done")
+    add_to_history("assistant", f"Completed sequence: {' then '.join(step_names)}")
+
+
+# ── Request queue: commands run one at a time, in order ───────────────────────
+request_queue  = queue.Queue()
+worker_started = [False]
+
+def _agent_worker():
+    """Single worker: processes robot requests one after another."""
+    while True:
+        user_text = request_queue.get()
         try:
-            resp = client.chat.completions.create(
-                model=QWEN_MODEL, messages=messages,
-                tools=AGENT_TOOLS, max_tokens=400)
-            msg = resp.choices[0].message
+            tq_cancel_event.clear()
+            run_agent(user_text, tq_cancel_event)
         except Exception as e:
-            print(f"[AGENT] Qwen error: {e}", file=sys.stderr, flush=True)
-            push_update("I had trouble thinking that through. Could you try again?", "error")
-            return
+            print(f"[WORKER] Error: {e}", file=sys.stderr, flush=True)
+            push_update("Something went wrong with that request.", "error")
+        finally:
+            request_queue.task_done()
 
-        # No tool call — Qwen is talking, treat as finish
-        if not msg.tool_calls:
-            text = (msg.content or "").strip()
-            if text:
-                push_update(text, "done")
-                add_to_history("assistant", text)
-            else:
-                # empty — nudge once
-                messages.append({"role":"user","content":"Please continue — call a tool or finish()."})
-                continue
-            return
+def _ensure_worker():
+    if not worker_started[0]:
+        worker_started[0] = True
+        threading.Thread(target=_agent_worker, daemon=True).start()
 
-        call = msg.tool_calls[0]
-        name = call.function.name
-        try:
-            args = json.loads(call.function.arguments) if call.function.arguments else {}
-        except Exception:
-            args = {}
 
-        print(f"[AGENT] Qwen chose: {name}({args})", file=sys.stderr, flush=True)
+def _classify_intent(user_text):
+    """
+    Decide if this is a ROBOT COMMAND or just CHAT/QUESTION.
+    Uses Qwen so it's smart, not keyword-matching.
+    Returns "command" or "chat".
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=QWEN_MODEL,
+            messages=[
+                {"role":"system","content":(
+                    "You classify messages for a hotel robot. Reply with ONE word only: "
+                    "'command' or 'chat'.\n"
+                    "'command' = the user wants the robot to physically DO something "
+                    "(go somewhere, move, wait, return to charger, a sequence of actions).\n"
+                    "'chat' = a question, greeting, or anything that does NOT require the robot to move "
+                    "(e.g. 'what can you do', 'hello', 'what's your battery', 'where are you').\n"
+                    "Reply with only the single word.")},
+                {"role":"user","content":user_text}
+            ],
+            max_tokens=5)
+        ans = (resp.choices[0].message.content or "").strip().lower()
+        print(f"[INTENT] '{user_text}' -> {ans}", file=sys.stderr, flush=True)
+        return "command" if "command" in ans else "chat"
+    except Exception as e:
+        print(f"[INTENT] Error: {e}, defaulting to chat", file=sys.stderr, flush=True)
+        return "chat"
 
-        # Record Qwen's decision in the message history
-        messages.append({
-            "role":"assistant","content":msg.content or "",
-            "tool_calls":[{"id":call.id,"type":"function",
-                           "function":{"name":name,"arguments":call.function.arguments or "{}"}}]
-        })
 
-        # finish() ends the loop
-        if name == "finish":
-            final = args.get("message","All done!")
-            push_update(final, "done")
-            add_to_history("assistant", final)
-            print(f"[AGENT] FINISHED: {final}", file=sys.stderr, flush=True)
-            return
+def _chat_reply(user_text):
+    """Answer a question/greeting conversationally, no robot action."""
+    try:
+        messages = [{"role":"system","content":(
+            "You are Aria, a warm hotel service robot assistant. Answer the user's question "
+            "or greeting conversationally in 1-3 sentences. Be helpful and friendly.\n"
+            "You can: navigate to locations (front desk, kitchen, meeting room, restaurant, "
+            "security, waiting area), return to your charger, wait for a set time, and do "
+            "multi-step sequences of these. Reply in the user's language.")}]
+        messages.extend(conversation_history[-MAX_HISTORY:])
+        resp = client.chat.completions.create(
+            model=QWEN_MODEL, messages=messages, max_tokens=200)
+        reply = (resp.choices[0].message.content or "").strip()
+        return reply or "I'm here to help! I can move around the hotel, return to charge, or run a sequence of tasks for you."
+    except Exception:
+        return "I can navigate to locations, return to my charger, wait, and run multi-step sequences. Just tell me what you need!"
 
-        # Execute the tool against the real robot
-        result = _execute_agent_tool(name, args, cancel_event)
-        print(f"[AGENT] Result: {json.dumps(result)[:150]}", file=sys.stderr, flush=True)
 
-        # Feed the REAL result back to Qwen, and remind it of the original goal
-        # so it continues with remaining steps instead of stopping early
-        result_msg = json.dumps(result)
-        reminder = (
-            f" [Original request was: '{user_text}'. "
-            f"If there are still steps remaining in that request, call the next tool now. "
-            f"Only call finish() when EVERYTHING in the original request is complete.]"
-        )
-        messages.append({
-            "role":"tool","tool_call_id":call.id,
-            "content": result_msg + reminder
-        })
+def _is_cancel(t):
+    """Detect a cancel/stop intent regardless of phrasing or length."""
+    cancel_words = ["cancel","stop","halt","abort","never mind","nevermind",
+                    "forget it","停止","取消","暂停"]
+    return any(w in t for w in cancel_words)
 
-    push_update("I've done everything I can for that request!", "done")
+def _is_resume(t):
+    resume_words = ["resume","continue","carry on","keep going","继续","开始"]
+    return any(w in t for w in resume_words)
 
 
 def handle_command(user_text):
     t_lower = user_text.lower().strip()
     add_to_history("user", user_text)
 
-    # Immediate control commands (don't go through agent)
-    if any(k in t_lower for k in ["stop","pause","halt","暂停","停止"]) and len(t_lower.split()) <= 3:
+    # ── Immediate control commands — always instant, any phrasing ──────────────
+    if _is_cancel(t_lower):
+        # Stop the robot, clear the whole queue and any pending requests
         tq_cancel_event.set()
         try: robot_cancel_task()
         except Exception: pass
-        try: requests.post("http://127.0.0.1:5050/tq/pause", timeout=2)
-        except Exception: pass
-        reply = "Stopped. Let me know when you'd like to continue."
+        with task_queue_lock:
+            task_queue.clear()
+        tq_push("cleared")
+        # Drain any queued requests
+        try:
+            while not request_queue.empty():
+                request_queue.get_nowait()
+                request_queue.task_done()
+        except Exception:
+            pass
+        reply = "Stopped everything and cleared the queue. Let me know what you'd like next!"
         add_to_history("assistant", reply)
         return reply, "cancelled", {}
 
-    if any(k in t_lower for k in ["resume","continue","继续"]) and len(t_lower.split()) <= 3:
+    if _is_resume(t_lower) and len(t_lower.split()) <= 3:
         try: requests.post("http://127.0.0.1:5050/tq/resume", timeout=2)
         except Exception: pass
         reply = "Resuming!"
         add_to_history("assistant", reply)
         return reply, "resumed", {}
 
-    # EVERYTHING else goes through the intelligent agent
-    print(f"[AGENT] New request: {user_text}", file=sys.stderr, flush=True)
-    tq_cancel_event.clear()
-    thread = threading.Thread(target=run_agent, args=(user_text, tq_cancel_event), daemon=True)
-    thread.start()
-    return "On it! Working through your request now.", "sequence_started", {}
+    # Classify: is this a robot command or just chat?
+    intent = _classify_intent(user_text)
+
+    if intent == "chat":
+        # Answer conversationally — no robot action, nothing queued
+        reply = _chat_reply(user_text)
+        add_to_history("assistant", reply)
+        return reply, None, {}
+
+    # It's a robot command — queue it so it runs after any current request
+    _ensure_worker()
+    # unfinished_tasks = items still being processed or waiting.
+    # If 0, the worker is idle and this will start immediately.
+    busy = request_queue.unfinished_tasks > 0
+    request_queue.put(user_text)
+    add_to_history("assistant", "Queued your request.")
+
+    if not busy:
+        return "On it! Working through your request now.", "sequence_started", {}
+    else:
+        waiting = request_queue.unfinished_tasks
+        return (f"Got it — I'll do this right after I finish what I'm working on. "
+                f"({waiting} in queue)"), "sequence_started", {}
 
 
 # ── Flask Routes ──────────────────────────────────────────────────────────────
@@ -1392,17 +1569,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .log-dot{width:5px;height:5px;border-radius:50%;background:var(--g);flex-shrink:0}
 .log-dot.err{background:#ef4444}.log-time{margin-left:auto;font-size:10px;color:var(--txm)}
 /* Task Queue */
-.tq-item{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;font-size:11px;border:1px solid var(--bd);background:var(--s2);transition:all .3s}
-.tq-item.in-progress{background:#E6F1FB;border-color:#B5D4F4}
-.tq-item.paused{background:#FAEEDA;border-color:#FAC775}
-.tq-item.completed{background:var(--gl);border-color:var(--glb)}
-.tq-item.cancelled{background:#FCEBEB;border-color:#F7C1C1}
-.tq-badge{font-size:9px;padding:1px 5px;border-radius:4px;font-weight:600;white-space:nowrap;flex-shrink:0}
-.tq-badge.in-progress{background:#185FA5;color:#fff}
+.tq-item{display:flex;flex-direction:column;gap:4px;padding:9px 11px;border-radius:9px;font-size:12px;border:1px solid var(--bd);background:var(--s2);transition:all .3s;position:relative;overflow:hidden}
+.tq-item.in-progress{background:#E6F1FB;border-color:#185FA5;box-shadow:0 0 0 1px #185FA5}
+.tq-item.paused{background:#FAEEDA;border-color:#BA7517}
+.tq-item.completed{background:var(--gl);border-color:var(--g)}
+.tq-item.cancelled{background:#FCEBEB;border-color:#A32D2D}
+.tq-item.planned{background:var(--s2);border-color:var(--bd)}
+.tq-row1{display:flex;align-items:center;gap:7px}
+.tq-num{width:18px;height:18px;border-radius:50%;background:var(--bd);color:var(--tx2);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.tq-item.in-progress .tq-num{background:#185FA5;color:#fff}
+.tq-item.completed .tq-num{background:var(--g);color:#fff}
+.tq-item.paused .tq-num{background:#BA7517;color:#fff}
+.tq-icon{font-size:15px;flex-shrink:0}
+.tq-label{flex:1;color:var(--tx);font-weight:600;font-size:12px}
+.tq-badge{font-size:9px;padding:2px 7px;border-radius:5px;font-weight:700;white-space:nowrap;flex-shrink:0;letter-spacing:.03em}
+.tq-badge.in-progress{background:#185FA5;color:#fff;animation:tqpulse 1.5s infinite}
 .tq-badge.planned{background:var(--bd);color:var(--tx2)}
 .tq-badge.completed{background:var(--g);color:#fff}
 .tq-badge.paused{background:#BA7517;color:#fff}
 .tq-badge.cancelled{background:#A32D2D;color:#fff}
+@keyframes tqpulse{0%,100%{opacity:1}50%{opacity:.55}}
+.tq-detail{font-size:10px;color:var(--tx2);padding-left:25px;line-height:1.4;font-variant-numeric:tabular-nums}
+.tq-api{font-size:9px;color:var(--txm);font-family:ui-monospace,monospace;padding-left:25px;word-break:break-all;opacity:.8}
+.tq-progress{position:absolute;bottom:0;left:0;height:2px;background:#185FA5;transition:width .5s;width:0}
+.tq-count{font-size:10px;color:var(--txm);font-weight:600;background:var(--s2);border:1px solid var(--bd);border-radius:5px;padding:1px 7px}
 </style>
 </head>
 <body>
@@ -1490,14 +1680,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
     </div>
 
     <div class="sec-label" style="display:flex;align-items:center;justify-content:space-between;padding-right:12px;flex-shrink:0">
-      <span>Task Queue</span>
+      <span style="display:flex;align-items:center;gap:7px">Task Queue <span class="tq-count" id="tq-count"></span></span>
       <div style="display:flex;gap:4px">
-        <button id="tq-start-btn" onclick="tqStart()" style="display:none;font-size:10px;padding:2px 7px;border-radius:4px;border:none;background:var(--g);color:#fff;cursor:pointer;font-weight:500">▶</button>
-        <button id="tq-pause-btn" onclick="tqPause()" style="display:none;font-size:10px;padding:2px 7px;border-radius:4px;border:1px solid var(--bd);background:var(--s2);color:var(--txm);cursor:pointer">⏸</button>
-        <button onclick="tqClearAll()" style="font-size:10px;padding:2px 5px;border-radius:4px;border:1px solid var(--bd);background:var(--s2);color:var(--txm);cursor:pointer">✕</button>
+        <button id="tq-start-btn" onclick="tqStart()" style="display:none;font-size:10px;padding:2px 8px;border-radius:5px;border:none;background:var(--g);color:#fff;cursor:pointer;font-weight:600">▶ Resume</button>
+        <button id="tq-pause-btn" onclick="tqPause()" style="display:none;font-size:10px;padding:2px 8px;border-radius:5px;border:1px solid var(--bd);background:var(--s2);color:var(--txm);cursor:pointer">⏸ Pause</button>
+        <button onclick="tqClearAll()" style="font-size:10px;padding:2px 7px;border-radius:5px;border:1px solid var(--bd);background:var(--s2);color:var(--txm);cursor:pointer">✕ Clear</button>
       </div>
     </div>
-    <div id="task-queue-list" style="overflow-y:auto;padding:0 10px;display:flex;flex-direction:column;gap:3px;flex:1;min-height:0"></div>
+    <div id="task-queue-list" style="overflow-y:auto;padding:0 10px 4px;display:flex;flex-direction:column;gap:6px;flex:1;min-height:0"></div>
     <div style="padding:5px 10px 8px;font-size:10px;color:var(--txm);text-align:center;flex-shrink:0">Click locations above to add tasks</div>
   </div>
 </div>
@@ -1711,99 +1901,68 @@ async function tqClearAll(){
   }catch(e){console.error("Clear failed:",e);}
 }
 
-function renderTQItem(task,animate){
+function renderTQItem(task, index, total){
   const el=document.createElement("div");
   el.id="tq-"+task.id;
-  el.className="tq-item "+(task.status||"planned");
-  if(animate){el.style.opacity="0";setTimeout(()=>{el.style.opacity="1";el.style.transition="opacity .3s";},10);}
-  el.innerHTML=
-    '<span style="font-size:12px">'+(TQ_ICONS[task.type]||"⚡")+'</span>'+
-    '<span style="flex:1;color:var(--tx);font-size:11px">'+(task.label||task.type)+'</span>'+
-    '<span class="tq-badge '+(task.status||"planned")+'">'+(TQ_LABELS[task.status]||task.status)+'</span>';
+  const st=(task.status||"planned");
+  el.className="tq-item "+st;
+  const num = (st==="completed") ? "\u2713" : (index+1);
+  let inner =
+    '<div class="tq-row1">'+
+      '<span class="tq-num">'+num+'</span>'+
+      '<span class="tq-icon">'+(TQ_ICONS[task.type]||"\u26A1")+'</span>'+
+      '<span class="tq-label">'+(task.label||task.type)+'</span>'+
+      '<span class="tq-badge '+st+'">'+(TQ_LABELS[st]||st)+'</span>'+
+    '</div>';
+  if(task.api)    inner += '<div class="tq-api">'+task.api+'</div>';
+  if(task.detail) inner += '<div class="tq-detail">'+task.detail+'</div>';
+  if(st==="in-progress"||st==="in_progress")
+    inner += '<div class="tq-progress" style="width:65%"></div>';
+  el.innerHTML=inner;
   return el;
 }
 
-function handleTQUpdate(data){
-  const list=document.getElementById("task-queue-list");
-  const id=data.task_id;
-  const el=id?document.getElementById("tq-"+id):null;
-
-  if(data.update_type==="add"){
-    const empty=list.querySelector("div:not(.tq-item)");if(empty)empty.remove();
-    const task={id,type:data.ttype,label:data.label,status:data.status||"planned"};
-    list.appendChild(renderTQItem(task,true));
-    // Show pause button, hide start button when items added
-    document.getElementById("tq-pause-btn").style.display="inline-block";
-    document.getElementById("tq-start-btn").style.display="none";
-    addLog((data.label||data.ttype)+" added","");
-  }
-  else if(data.update_type==="status"&&el){
-    el.className="tq-item "+(data.status||"planned");
-    el.style.cssText="flex-direction:column;align-items:stretch;gap:3px;";
-    const badge=document.getElementById("tq-badge-"+id);
-    if(badge){badge.className="tq-badge "+(data.status||"planned");badge.textContent=TQ_LABELS[data.status]||data.status;}
-    // Update live detail text
-    const detailEl=document.getElementById("tq-detail-"+id);
-    if(detailEl&&data.detail!==undefined)detailEl.textContent=data.detail;
-    // Update API endpoint shown
-    const apiEl=document.getElementById("tq-api-"+id);
-    if(apiEl&&data.api)apiEl.textContent=data.api;
-    else if(!apiEl&&data.api){
-      const d=document.createElement("div");d.id="tq-api-"+id;
-      d.style="font-size:9px;color:var(--txm);font-family:monospace;padding-left:18px";
-      d.textContent=data.api;el.insertBefore(d,detailEl);
-    }
-    if(data.status==="completed"||data.status==="cancelled"){
-      setTimeout(()=>{
-        if(el){el.style.opacity="0";el.style.transform=data.status==="completed"?"translateX(16px)":"translateX(-16px)";el.style.transition="all .35s";
-          setTimeout(()=>{el.remove();checkTQEmpty();},350);}
-      },data.status==="completed"?700:150);
-    }
-  }
-  else if(data.update_type==="remove"&&el){el.remove();checkTQEmpty();}
-  else if(data.update_type==="cleared"){
-    list.innerHTML='<div style="font-size:11px;color:var(--txm);padding:6px 2px">No tasks yet</div>';
-    document.getElementById("tq-start-btn").style.display="none";
-    document.getElementById("tq-pause-btn").style.display="none";
-  }
-  else if(data.update_type==="paused_all"){
-    document.getElementById("tq-pause-btn").style.display="none";
-    document.getElementById("tq-start-btn").style.display="inline-block";
-    list.querySelectorAll(".tq-item.planned").forEach(item=>{
-      item.className="tq-item paused";
-      const b=item.querySelector(".tq-badge");if(b){b.className="tq-badge paused";b.textContent="PAUSED";}
-    });
-  }
-  else if(data.update_type==="resumed"){
-    document.getElementById("tq-start-btn").style.display="none";
-    document.getElementById("tq-pause-btn").style.display="inline-block";
-    list.querySelectorAll(".tq-item.paused").forEach(item=>{
-      item.className="tq-item planned";
-      const b=item.querySelector(".tq-badge");if(b){b.className="tq-badge planned";b.textContent="PLANNED";}
-    });
-  }
-}
-
-function checkTQEmpty(){
-  const list=document.getElementById("task-queue-list");
-  if(!list.querySelector(".tq-item")){
-    list.innerHTML='<div style="font-size:11px;color:var(--txm);padding:6px 2px">No tasks yet</div>';
-    document.getElementById("tq-start-btn").style.display="none";
-    document.getElementById("tq-pause-btn").style.display="none";
-  }
-}
-
-async function loadTQState(){
+// Poll /tq/state as the SINGLE SOURCE OF TRUTH so tasks never get dropped
+let _lastTQSig = "";
+async function syncTaskQueue(){
   try{
-    const res=await fetch("/tq/state");const d=await res.json();
-    const list=document.getElementById("task-queue-list");list.innerHTML="";
-    if(!d.tasks||!d.tasks.length){checkTQEmpty();return;}
-    d.tasks.forEach(t=>list.appendChild(renderTQItem(t,false)));
+    const res=await fetch("/tq/state");
+    const d=await res.json();
+    const tasks=d.tasks||[];
+    const sig=JSON.stringify(tasks.map(t=>[t.id,t.status,t.detail]))+"|"+d.paused;
+    if(sig===_lastTQSig) return;
+    _lastTQSig=sig;
+
+    const list=document.getElementById("task-queue-list");
+    const header=document.getElementById("tq-count");
+
+    if(!tasks.length){
+      list.innerHTML='<div style="font-size:11px;color:var(--txm);padding:10px 4px;text-align:center">No tasks yet \u2014 send a command or click a location</div>';
+      if(header) header.textContent="";
+      document.getElementById("tq-start-btn").style.display="none";
+      document.getElementById("tq-pause-btn").style.display="none";
+      return;
+    }
+
+    const active=tasks.filter(t=>t.status!=="completed"&&t.status!=="cancelled").length;
+    if(header) header.textContent=active+" active";
+
+    list.innerHTML="";
+    tasks.forEach((t,i)=>list.appendChild(renderTQItem(t,i,tasks.length)));
+
     document.getElementById("tq-pause-btn").style.display=d.paused?"none":"inline-block";
     document.getElementById("tq-start-btn").style.display=d.paused?"inline-block":"none";
   }catch(e){}
 }
-loadTQState();
+setInterval(syncTaskQueue, 800);
+syncTaskQueue();
+
+function handleTQUpdate(data){
+  if(data.update_type==="add") addLog((data.label||data.ttype||"task")+" queued","");
+  syncTaskQueue();
+}
+function checkTQEmpty(){ syncTaskQueue(); }
+function loadTQState(){ syncTaskQueue(); }
 
 // ── SSE ───────────────────────────────────────────────────────
 const evtSource=new EventSource("/stream");
@@ -1997,4 +2156,4 @@ if __name__ == "__main__":
     print(f"  tailnet → http://100.115.171.5:5050")
     print("="*52 + "\n")
 
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
